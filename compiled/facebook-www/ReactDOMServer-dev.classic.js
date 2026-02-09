@@ -4014,6 +4014,7 @@ __DEV__ &&
               throw thenable.reason;
           }
           suspendedThenable = thenable;
+          shouldCaptureSuspendedCallSite && captureSuspendedCallSite();
           throw SuspenseException;
       }
     }
@@ -4025,6 +4026,50 @@ __DEV__ &&
       var thenable = suspendedThenable;
       suspendedThenable = null;
       return thenable;
+    }
+    function captureSuspendedCallSite() {
+      var currentTask = currentTaskInDEV;
+      if (null === currentTask)
+        throw Error(
+          "Expected to have a current task when tracking a suspend call site. This is a bug in React."
+        );
+      var currentComponentStack = currentTask.componentStack;
+      if (null === currentComponentStack)
+        throw Error(
+          "Expected to have a component stack on the current task when tracking a suspended call site. This is a bug in React."
+        );
+      suspendedCallSiteStack = {
+        parent: currentComponentStack.parent,
+        type: currentComponentStack.type,
+        owner: currentComponentStack.owner,
+        stack: Error("react-stack-top-frame")
+      };
+      suspendedCallSiteDebugTask = currentTask.debugTask;
+    }
+    function ensureSuspendableThenableStateDEV(thenableState) {
+      var lastThenable = thenableState[thenableState.length - 1];
+      switch (lastThenable.status) {
+        case "fulfilled":
+          var previousThenableValue = lastThenable.value,
+            previousThenableThen = lastThenable.then.bind(lastThenable);
+          delete lastThenable.value;
+          delete lastThenable.status;
+          lastThenable.then = noop;
+          return function () {
+            lastThenable.then = previousThenableThen;
+            lastThenable.value = previousThenableValue;
+            lastThenable.status = "fulfilled";
+          };
+        case "rejected":
+          var previousThenableReason = lastThenable.reason;
+          delete lastThenable.reason;
+          delete lastThenable.status;
+          return function () {
+            lastThenable.reason = previousThenableReason;
+            lastThenable.status = "rejected";
+          };
+      }
+      return noop;
     }
     function is(x, y) {
       return (x === y && (0 !== x || 1 / x === 1 / y)) || (x !== x && y !== y);
@@ -4929,6 +4974,61 @@ __DEV__ &&
             }
           }
         }
+    }
+    function pushSuspendedCallSiteOnComponentStack(request, task) {
+      shouldCaptureSuspendedCallSite = !0;
+      var restoreThenableState = ensureSuspendableThenableStateDEV(
+        task.thenableState
+      );
+      try {
+        var prevStatus = request.status;
+        request.status = 15;
+        var prevContext = currentActiveSnapshot,
+          prevDispatcher = ReactSharedInternals.H;
+        ReactSharedInternals.H = HooksDispatcher;
+        var prevAsyncDispatcher = ReactSharedInternals.A;
+        ReactSharedInternals.A = DefaultAsyncDispatcher;
+        var prevRequest = currentRequest;
+        currentRequest = request;
+        var prevGetCurrentStackImpl = ReactSharedInternals.getCurrentStack;
+        ReactSharedInternals.getCurrentStack = getCurrentStackInDEV;
+        var prevResumableState = currentResumableState;
+        currentResumableState = request.resumableState;
+        switchContext(task.context);
+        var prevTaskInDEV = currentTaskInDEV;
+        currentTaskInDEV = task;
+        try {
+          retryNode(request, task);
+        } catch (x) {
+          resetHooksState();
+        } finally {
+          (currentTaskInDEV = prevTaskInDEV),
+            (currentResumableState = prevResumableState),
+            (ReactSharedInternals.H = prevDispatcher),
+            (ReactSharedInternals.A = prevAsyncDispatcher),
+            (ReactSharedInternals.getCurrentStack = prevGetCurrentStackImpl),
+            prevDispatcher === HooksDispatcher && switchContext(prevContext),
+            (currentRequest = prevRequest),
+            (request.status = prevStatus);
+        }
+      } finally {
+        restoreThenableState(), (shouldCaptureSuspendedCallSite = !1);
+      }
+      null === suspendedCallSiteStack
+        ? (request = null)
+        : ((request = suspendedCallSiteStack), (suspendedCallSiteStack = null));
+      null === suspendedCallSiteDebugTask
+        ? (restoreThenableState = null)
+        : ((restoreThenableState = suspendedCallSiteDebugTask),
+          (suspendedCallSiteDebugTask = null));
+      null !== request &&
+        (task.componentStack = {
+          owner: task.componentStack,
+          parent: request.parent,
+          stack: request.stack,
+          type: request.type
+        });
+      task.debugTask = restoreThenableState;
     }
     function pushServerComponentStack(task, debugInfo) {
       if (null != debugInfo)
@@ -6399,7 +6499,7 @@ __DEV__ &&
               return;
             case REACT_LAZY_TYPE:
               var Component = callLazyInitInDEV(type);
-              if (12 === request.status) throw null;
+              if (12 === request.status && 15 !== request.status) throw null;
               renderElement(request, task, keyPath, Component, props, ref);
               return;
           }
@@ -7367,31 +7467,31 @@ __DEV__ &&
         if (6 === segment.status) return;
         segment.status = ABORTED;
       }
-      var errorInfo = getThrownInfo(task.componentStack);
-      if (enableAsyncDebugInfo) {
-        var node = task.node;
-        if (null !== node && "object" === typeof node) {
-          for (
-            var debugInfo = node._debugInfo;
-            "object" === typeof node &&
-            null !== node &&
-            node.$$typeof === REACT_LAZY_TYPE;
-
-          ) {
-            var payload = node._payload;
-            if ("fulfilled" === payload.status) node = payload.value;
-            else break;
-          }
+      var errorInfo = getThrownInfo(task.componentStack),
+        node = task.node;
+      if (null !== node && "object" === typeof node) {
+        for (
+          var debugInfo = node._debugInfo;
           "object" === typeof node &&
-            null !== node &&
-            (isArrayImpl(node) ||
-              "function" === typeof node[ASYNC_ITERATOR] ||
-              node.$$typeof === REACT_ELEMENT_TYPE ||
-              node.$$typeof === REACT_LAZY_TYPE) &&
-            isArrayImpl(node._debugInfo) &&
-            (debugInfo = node._debugInfo);
-          pushHaltedAwaitOnComponentStack(task, debugInfo);
+          null !== node &&
+          node.$$typeof === REACT_LAZY_TYPE;
+
+        ) {
+          var payload = node._payload;
+          if ("fulfilled" === payload.status) node = payload.value;
+          else break;
         }
+        "object" === typeof node &&
+          null !== node &&
+          (isArrayImpl(node) ||
+            "function" === typeof node[ASYNC_ITERATOR] ||
+            node.$$typeof === REACT_ELEMENT_TYPE ||
+            node.$$typeof === REACT_LAZY_TYPE) &&
+          isArrayImpl(node._debugInfo) &&
+          (debugInfo = node._debugInfo);
+        pushHaltedAwaitOnComponentStack(task, debugInfo);
+        null !== task.thenableState &&
+          pushSuspendedCallSiteOnComponentStack(request, task);
       }
       if (null === boundary) {
         if (13 !== request.status && request.status !== CLOSED) {
@@ -8851,17 +8951,7 @@ __DEV__ &&
     }
     var React = require("react"),
       ReactDOM = require("react-dom"),
-      dynamicFeatureFlags = require("ReactFeatureFlags"),
-      disableLegacyContextForFunctionComponents =
-        dynamicFeatureFlags.disableLegacyContextForFunctionComponents,
-      enableTransitionTracing = dynamicFeatureFlags.enableTransitionTracing,
-      renameElementSymbol = dynamicFeatureFlags.renameElementSymbol,
-      enableViewTransition = dynamicFeatureFlags.enableViewTransition,
-      enableAsyncDebugInfo = dynamicFeatureFlags.enableAsyncDebugInfo,
-      REACT_LEGACY_ELEMENT_TYPE = Symbol.for("react.element"),
-      REACT_ELEMENT_TYPE = renameElementSymbol
-        ? Symbol.for("react.transitional.element")
-        : REACT_LEGACY_ELEMENT_TYPE,
+      REACT_ELEMENT_TYPE = Symbol.for("react.transitional.element"),
       REACT_PORTAL_TYPE = Symbol.for("react.portal"),
       REACT_FRAGMENT_TYPE = Symbol.for("react.fragment"),
       REACT_STRICT_MODE_TYPE = Symbol.for("react.strict_mode"),
@@ -8883,6 +8973,11 @@ __DEV__ &&
       ASYNC_ITERATOR = Symbol.asyncIterator,
       REACT_OPTIMISTIC_KEY = Symbol.for("react.optimistic_key"),
       isArrayImpl = Array.isArray,
+      dynamicFeatureFlags = require("ReactFeatureFlags"),
+      disableLegacyContextForFunctionComponents =
+        dynamicFeatureFlags.disableLegacyContextForFunctionComponents,
+      enableTransitionTracing = dynamicFeatureFlags.enableTransitionTracing,
+      enableViewTransition = dynamicFeatureFlags.enableViewTransition,
       jsxPropsParents = new WeakMap(),
       jsxChildrenParents = new WeakMap(),
       CLIENT_REFERENCE_TAG = Symbol.for("react.client.reference"),
@@ -9980,7 +10075,7 @@ __DEV__ &&
       didWarnFormActionTarget = !1,
       didWarnFormActionMethod = !1,
       formReplayingRuntimeScript =
-        'addEventListener("submit",function(a){if(!a.defaultPrevented){var c=a.target,d=a.submitter,e=c.action,b=d;if(d){var f=d.getAttribute("formAction");null!=f&&(e=f,b=null)}"javascript:throw new Error(\'React form unexpectedly submitted.\')"===e&&(a.preventDefault(),b?(a=document.createElement("input"),a.name=b.name,a.value=b.value,b.parentNode.insertBefore(a,b),b=new FormData(c),a.parentNode.removeChild(a)):b=new FormData(c),a=c.ownerDocument||c,(a.$$reactFormReplay=a.$$reactFormReplay||[]).push(c,d,b))}});',
+        'addEventListener("submit",function(a){if(!a.defaultPrevented){var b=a.target,d=a.submitter,c=b.action,e=d;if(d){var f=d.getAttribute("formAction");null!=f&&(c=f,e=null)}"javascript:throw new Error(\'React form unexpectedly submitted.\')"===c&&(a.preventDefault(),a=new FormData(b,e),c=b.ownerDocument||b,(c.$$reactFormReplay=c.$$reactFormReplay||[]).push(b,d,a))}});',
       styleRegex = /(<\/|<)(s)(tyle)/gi,
       leadingNewline = "\n",
       VALID_TAG_REGEX = /^[a-zA-Z][a-zA-Z:_\.\-\d]*$/,
@@ -10137,10 +10232,14 @@ __DEV__ &&
       clz32 = Math.clz32 ? Math.clz32 : clz32Fallback,
       log = Math.log,
       LN2 = Math.LN2,
+      currentTaskInDEV = null,
       SuspenseException = Error(
         "Suspense Exception: This is not a real error! It's an implementation detail of `use` to interrupt the current render. You must either rethrow it immediately, or move the `use` call outside of the `try/catch` block. Capturing without rethrowing will lead to unexpected behavior.\n\nTo handle async errors, wrap your component in an error boundary, or call the promise's `.catch` method and pass the result to `use`."
       ),
       suspendedThenable = null,
+      shouldCaptureSuspendedCallSite = !1,
+      suspendedCallSiteStack = null,
+      suspendedCallSiteDebugTask = null,
       objectIs = "function" === typeof Object.is ? Object.is : is,
       currentlyRenderingComponent = null,
       currentlyRenderingTask = null,
@@ -10255,7 +10354,6 @@ __DEV__ &&
         }
       },
       currentResumableState = null,
-      currentTaskInDEV = null,
       DefaultAsyncDispatcher = {
         getCacheForType: function () {
           throw Error("Not implemented.");
@@ -10354,5 +10452,5 @@ __DEV__ &&
         'The server used "renderToString" which does not support Suspense. If you intended for this Suspense boundary to render the fallback content on the server consider throwing an Error somewhere within the Suspense boundary. If you intended to have the server wait for the suspended component please switch to "renderToReadableStream" which supports Suspense on the server'
       );
     };
-    exports.version = "19.3.0-www-classic-fd524fe0-20251121";
+    exports.version = "19.3.0-www-classic-2dd9b7cf-20260208";
   })();
